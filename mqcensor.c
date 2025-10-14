@@ -2,6 +2,7 @@
 #include "pico/stdlib.h"
 #include "pico/cyw43_arch.h"
 #include "hardware/i2c.h"
+#include "hardware/watchdog.h"
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
 #include "lwip/apps/mqtt.h"
@@ -14,13 +15,53 @@
 #define MQTT_TOPIC "pico2w/aht22"
 #define DHT_PIN 17
 
+static absolute_time_t last_ok; // 直近で「正常」だった時刻（リンク or MQTT OK）
+#define WD_TIMEOUT_MS 8000      // WDT 8秒
+#define DEADLINE_MS 300000      // 5分復帰しなければ最終手段
+#define SAFE_REBOOTS 5          // 5連続再起動でセーフモード突入
+
+static inline bool ms_passed(absolute_time_t t, uint32_t ms)
+{
+    return absolute_time_diff_us(t, get_absolute_time()) / 1000 > ms;
+}
+
+static void wd_init_and_bootloop_guard(bool *safe_mode_out)
+{
+    // 連続再起動回数を scratch レジスタに保存
+    uint32_t cnt = watchdog_hw->scratch[0];
+    if (watchdog_caused_reboot())
+        cnt++;
+    else
+        cnt = 0;
+    watchdog_hw->scratch[0] = cnt;
+
+    *safe_mode_out = (cnt >= SAFE_REBOOTS);
+
+    // 有効化（デバッガ接続時は一時停止 true）
+    watchdog_enable(WD_TIMEOUT_MS, true);
+}
+
+static void wd_feed(void)
+{
+    watchdog_update();
+}
+
+static void request_reboot_now(const char *reason)
+{
+    printf("WDT reboot requested: %s\n", reason);
+    sleep_ms(50);
+    watchdog_reboot(0, 0, 0);
+    while (1)
+        tight_loop_contents();
+}
+
 typedef struct
 {
     float temp;
     float hum;
 } AHT22Result;
 
-static AHT22Result FAILRESULT = {-1.0f, -1.0f};
+static const AHT22Result FAILRESULT = {-1.0f, -1.0f};
 
 static AHT22Result new_aht22result(float temperature, float humidity)
 {
@@ -31,6 +72,20 @@ static AHT22Result new_aht22result(float temperature, float humidity)
 static bool is_failed(AHT22Result *result)
 {
     return result->hum <= 0.0f || result->temp <= 0.0f;
+}
+
+static bool link_is_up(void)
+{
+    int st = cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA);
+    return st == CYW43_LINK_UP;
+}
+
+static bool wifi_connect(void)
+{
+    int r = cyw43_arch_wifi_connect_timeout_ms(
+        WIFI_SSID, WIFI_PASS, CYW43_AUTH_WPA2_AES_PSK, 30000);
+
+    return r == 0;
 }
 
 static void print_ip(void)
@@ -55,7 +110,6 @@ static void print_ip(void)
 
 static mqtt_client_t *client;
 static volatile bool mqtt_connected = false;
-static volatile bool mqtt_failed = false;
 const int SUCCESS = 6;
 
 static void mqtt_pub_request_cb(void *arg, err_t result)
@@ -69,7 +123,7 @@ static void mqtt_connection_cb(mqtt_client_t *client, void *arg, mqtt_connection
     if (status == MQTT_CONNECT_ACCEPTED)
         mqtt_connected = true;
     else
-        mqtt_failed = true; // エラーを検知
+        mqtt_connected = false; // エラーを検知
 }
 
 static AHT22Result read_aht20(void)
@@ -86,16 +140,30 @@ static AHT22Result read_aht20(void)
         uint32_t raw_t = (((uint32_t)buf[3] & 0x0F) << 16) | ((uint32_t)buf[4] << 8) | buf[5];
         float hum = (raw_h * 100.0f) / 1048576.0f;
         float tmp = (raw_t * 200.0f) / 1048576.0f - 50.0f;
-        printf("AHT20: Temp=%.1f°C  Hum=%.1f%%\n", tmp, hum);
+        // printf("AHT20: Temp=%.1f°C  Hum=%.1f%%\n", tmp, hum);
         return new_aht22result(tmp, hum);
     }
     else
     {
-        printf("AHT20 read failed (r=%d)\n", r);
+        // printf("AHT20 read failed (r=%d)\n", r);
     }
     // 取得失敗
     // -1度以下になることを考慮していない。埼玉だから問題なしか、、、
     return FAILRESULT;
+}
+
+static struct mqtt_connect_client_info_t create_mqtt_client(void)
+{
+    struct mqtt_connect_client_info_t ci = {0};
+    ci.client_id = MQTT_CLIENT_ID;
+    ci.will_msg = "offline";
+    ci.keep_alive = 30;
+    ci.will_qos = 1;
+    ci.will_retain = 1;
+    ci.client_user = NULL;
+    ci.client_pass = NULL;
+
+    return ci;
 }
 
 int main()
@@ -110,6 +178,8 @@ int main()
     sleep_ms(1500);
     printf("Pico2W MQTT publisher start\n");
 
+    bool safe_mode = false;
+    wd_init_and_bootloop_guard(&safe_mode);
     // Wi-Fi/LwIP 初期化（BG スレッドで動く）
     if (cyw43_arch_init())
     {
@@ -120,16 +190,22 @@ int main()
     cyw43_arch_enable_sta_mode();
 
     printf("Connecting to Wi-Fi SSID: %s\n", WIFI_SSID);
-    int r = cyw43_arch_wifi_connect_timeout_ms(
-        WIFI_SSID, WIFI_PASS, CYW43_AUTH_WPA2_AES_PSK, 30000);
-    if (r)
+    if (!safe_mode)
     {
-        printf("Wi-Fi connect failed: %d\n", r);
-        return -1;
+        bool ok = wifi_connect(); // 既存の関数
+        if (!ok)
+            printf("Wi-Fi connect failed at boot\n");
+
+        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
+    }
+    else
+    {
+        // セーフモード：Wi-Fiを明示的に下げる（人が触れる状態を優先）
+        cyw43_wifi_set_up(&cyw43_state, CYW43_ITF_STA, false, 0);
+        printf("SAFE MODE: Wi-Fi disabled due to repeated reboots\n");
+        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
     }
 
-    // LED 点灯で接続表示（任意）
-    cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
     printf("Wi-Fi connected.\n");
 
     client = mqtt_client_new();
@@ -142,11 +218,7 @@ int main()
     ip_addr_t broker_addr;
     ipaddr_aton(MQTT_BROKER_IP, &broker_addr);
 
-    struct mqtt_connect_client_info_t ci = {0};
-    ci.client_id = MQTT_CLIENT_ID;
-    ci.keep_alive = 30;
-    ci.client_user = NULL;
-    ci.client_pass = NULL;
+    struct mqtt_connect_client_info_t ci = create_mqtt_client();
 
     cyw43_arch_lwip_begin();
     err_t err = mqtt_client_connect(client, &broker_addr, MQTT_BROKER_PORT, mqtt_connection_cb, NULL, &ci);
@@ -163,8 +235,19 @@ int main()
         sleep_ms(10);
     }
 
+    last_ok = get_absolute_time();
     while (true)
     {
+        wd_feed();
+        if (link_is_up() && mqtt_connected)
+        {
+            last_ok = get_absolute_time();
+        }
+        // 5分以上「リンクUP && MQTT接続」の状態に戻れない → 最終手段
+        if (!safe_mode && ms_passed(last_ok, DEADLINE_MS))
+        {
+            request_reboot_now("no recovery >5min");
+        }
         char payload[64];
         AHT22Result r = read_aht20();
         if (is_failed(&r))
@@ -175,7 +258,9 @@ int main()
         {
             snprintf(payload, sizeof(payload), "Temp=%.1f°C Hum=%.1f%%", r.temp, r.hum);
         }
+        cyw43_arch_lwip_begin();
         err_t pe = mqtt_publish(client, MQTT_TOPIC, payload, strlen(payload), 0, 0, mqtt_pub_request_cb, NULL);
+        cyw43_arch_lwip_end();
         printf("publish: %s (err=%d)\n", payload, pe);
         sleep_ms(1000);
     }
