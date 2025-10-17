@@ -61,7 +61,7 @@ typedef struct
     float hum;
 } AHT22Result;
 
-static const AHT22Result FAILRESULT = {-1.0f, -1.0f};
+static const AHT22Result FAILRESULT = {-100.0f, -100.0f};
 
 static AHT22Result new_aht22result(float temperature, float humidity)
 {
@@ -71,7 +71,7 @@ static AHT22Result new_aht22result(float temperature, float humidity)
 
 static bool is_failed(AHT22Result *result)
 {
-    return result->hum <= 0.0f || result->temp <= 0.0f;
+    return result->hum == -100.0f || result->temp <= -100.0f;
 }
 
 static bool link_is_up(void)
@@ -150,6 +150,27 @@ static AHT22Result read_aht20(void)
     // 取得失敗
     // -1度以下になることを考慮していない。埼玉だから問題なしか、、、
     return FAILRESULT;
+}
+
+static bool wifi_mqtt_conn_init(ip_addr_t broker_addr, struct mqtt_connect_client_info_t ci)
+{
+    bool ok = wifi_connect(); // 既存の関数
+    if (!ok)
+    {
+        printf("Wi-Fi connect failed at boot\n");
+        return false;
+    }
+    cyw43_arch_lwip_begin();
+    err_t err = mqtt_client_connect(client, &broker_addr, MQTT_BROKER_PORT, mqtt_connection_cb, NULL, &ci);
+    cyw43_arch_lwip_end();
+    if (err != ERR_OK)
+    {
+        printf("mqtt_client_connect err=%d\n", err);
+        return false;
+    }
+
+    cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
+    return true;
 }
 
 static struct mqtt_connect_client_info_t create_mqtt_client(void)
@@ -242,6 +263,15 @@ int main()
         if (link_is_up() && mqtt_connected)
         {
             last_ok = get_absolute_time();
+        }
+        else
+        {
+            bool is_success = wifi_mqtt_conn_init(broker_addr, ci);
+            if (!is_success)
+            {
+                sleep_ms(1000);
+                continue;
+            }
         }
         // 5分以上「リンクUP && MQTT接続」の状態に戻れない → 最終手段
         if (!safe_mode && ms_passed(last_ok, DEADLINE_MS))
