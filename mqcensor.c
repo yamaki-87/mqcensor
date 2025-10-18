@@ -213,10 +213,11 @@ int main()
     printf("Connecting to Wi-Fi SSID: %s\n", WIFI_SSID);
     if (!safe_mode)
     {
-        bool ok = wifi_connect(); // 既存の関数
-        if (!ok)
-            printf("Wi-Fi connect failed at boot\n");
-
+        // wifiがつながるまで無限ループ
+        while (!wifi_connect())
+        {
+            sleep_ms(2000);
+        }
         cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
     }
     else
